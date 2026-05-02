@@ -1,0 +1,288 @@
+import argparse
+import os
+import glob
+import pandas as pd
+from PIL import Image
+import kagglehub
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
+
+from datasets import load_dataset
+
+# ==============================================================================
+# 1. GTSRB TEST DATASET
+# ==============================================================================
+class GTSRBTestDataset(Dataset):
+    def __init__(self, csv_file, root_dir, class_to_idx, transform=None):
+        self.annotations = pd.read_csv(csv_file)
+        self.root_dir = root_dir
+        self.class_to_idx = class_to_idx
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.annotations.iloc[idx, 7])
+        image = Image.open(img_path).convert("RGB")
+
+        label = int(self.class_to_idx[str(self.annotations.iloc[idx, 6])])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# ==============================================================================
+# 2. SYNSET DATASET
+# ==============================================================================
+class SynsetDataset(Dataset):
+    def __init__(self, split="train", transform=None):
+        target_split = "validation" if split == "test" else "train"
+        self.ds = load_dataset(
+            "FraunhoferIOSB/Synset-Signset-Germany",
+            "Cycles",
+            split=target_split
+        )
+
+        self.indices = [i for i, l in enumerate(self.ds["label"]) if int(l) < 43]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        item = self.ds[self.indices[idx]]
+        image = item["image"].convert("RGB")
+        label = int(item["label"])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# ==============================================================================
+# 3. GTSDB WILD DATASET (FIXED + CLEAN CROPPING)
+# ==============================================================================
+class WildGTSDBDataset(Dataset):
+    def __init__(self, transform=None):
+        path = kagglehub.dataset_download(
+            "safabouguezzi/german-traffic-sign-detection-benchmark-gtsdb"
+        )
+
+        gt_file = glob.glob(os.path.join(path, "**", "gt.txt"), recursive=True)[0]
+
+        self.annotations = pd.read_csv(
+            gt_file,
+            sep=";",
+            header=None,
+            names=["file", "left", "top", "right", "bottom", "label"]
+        )
+
+        self.root = os.path.dirname(gt_file)
+        self.transform = transform
+
+        self.samples = []
+
+        for _, row in self.annotations.iterrows():
+            label = int(row["label"])
+            if label < 0 or label >= 43:
+                continue
+
+            w = row["right"] - row["left"]
+            h = row["bottom"] - row["top"]
+
+            # 🔥 noise filtering
+            if w < 20 or h < 20:
+                continue
+
+            img_path = os.path.join(self.root, row["file"])
+
+            self.samples.append((img_path, label, row["left"], row["top"], w, h))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label, x, y, w, h = self.samples[idx]
+        image = Image.open(img_path).convert("RGB")
+
+        # ==========================================================
+        # 🔥 CENTERED SQUARE CROP (MOST IMPORTANT FIX)
+        # ==========================================================
+        cx = x + w / 2
+        cy = y + h / 2
+
+        size = max(w, h) * 1.5
+
+        left = max(0, cx - size / 2)
+        top = max(0, cy - size / 2)
+        right = min(image.width, cx + size / 2)
+        bottom = min(image.height, cy + size / 2)
+
+        image = image.crop((left, top, right, bottom))
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# ==============================================================================
+# 4. MODEL (ResNet-18 fine-tuned)
+# ==============================================================================
+def get_model():
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+    model.fc = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(model.fc.in_features, 43)
+    )
+
+    return model
+
+
+# ==============================================================================
+# 5. MAIN
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ==========================================================
+    # TRANSFORMS (DOMAIN GENERALIZATION)
+    # ==========================================================
+
+    train_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),
+        transforms.RandomPerspective(0.3),
+        transforms.GaussianBlur(3),
+        transforms.ToTensor(),
+        transforms.RandomErasing(p=0.3),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                             (0.229, 0.224, 0.225))
+    ])
+
+    test_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                             (0.229, 0.224, 0.225))
+    ])
+
+    # ==========================================================
+    # DATA
+    # ==========================================================
+    path = kagglehub.dataset_download(
+        "meowmeowmeowmeowmeow/gtsrb-german-traffic-sign"
+    )
+
+    gtsrb_train = datasets.ImageFolder(
+        os.path.join(path, "Train"),
+        transform=train_tf
+    )
+
+    synset_train = SynsetDataset(split="train", transform=train_tf)
+
+    train_pool = ConcatDataset([gtsrb_train, synset_train])
+
+    train_size = int(len(train_pool) * 0.9)
+    val_size = len(train_pool) - train_size
+
+    train_ds, val_ds = random_split(train_pool, [train_size, val_size])
+
+    gtsrb_test = GTSRBTestDataset(
+        os.path.join(path, "Test.csv"),
+        path,
+        gtsrb_train.class_to_idx,
+        transform=test_tf
+    )
+
+    synset_test = SynsetDataset(split="test", transform=test_tf)
+    wild_test = WildGTSDBDataset(transform=test_tf)
+
+    # ==========================================================
+    # LOADERS
+    # ==========================================================
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
+    wild_loader = DataLoader(wild_test, batch_size=args.batch_size)
+
+    # ==========================================================
+    # TRAIN
+    # ==========================================================
+    model = get_model().to(device)
+    opt = optim.AdamW(model.parameters(), lr=args.lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    scaler = torch.cuda.amp.GradScaler()
+
+    for epoch in range(args.epochs):
+        model.train()
+
+        total, correct = 0, 0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            opt.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                pred = model(x)
+                loss = loss_fn(pred, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            correct += (pred.argmax(1) == y).sum().item()
+            total += y.size(0)
+
+        train_acc = correct / total
+
+        # VAL
+        model.eval()
+        v_c, v_t = 0, 0
+
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                pred = model(x)
+                v_c += (pred.argmax(1) == y).sum().item()
+                v_t += y.size(0)
+
+        val_acc = v_c / v_t
+
+        print(f"[{epoch}] train:{train_acc:.3f} val:{val_acc:.3f}")
+
+    # ==========================================================
+    # WILD EVAL
+    # ==========================================================
+    model.eval()
+    c, t = 0, 0
+
+    with torch.no_grad():
+        for x, y in wild_loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            c += (pred.argmax(1) == y).sum().item()
+            t += y.size(0)
+
+    print("\n🔥 WILD ACC:", c / t)
+
+
+if __name__ == "__main__":
+    main()
